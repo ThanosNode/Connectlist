@@ -1,0 +1,1471 @@
+import type { Express, Request, Response, NextFunction } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import express from "express";
+import { z } from "zod";
+import { insertUserSchema, insertListingSchema, insertPaymentSchema, insertReportSchema, userRoleEnum } from "@shared/schema";
+import bcrypt from 'bcrypt';
+import { randomUUID } from 'crypto';
+import axios from 'axios';
+import { createCharge, processWebhookEvent, verifyWebhookSignature } from './services/coinbase';
+import helmet from 'helmet'; // Security middleware
+
+// Authentication middleware
+const isAuthenticated = (req: Request, res: Response, next: NextFunction) => {
+  if (!req.session.userId) {
+    return res.status(401).json({ message: 'Not authenticated' });
+  }
+  next();
+};
+
+// Admin role validation middleware
+const isAdmin = async (req: Request, res: Response, next: NextFunction) => {
+  if (!req.session.userId) {
+    return res.status(401).json({ message: 'Not authenticated' });
+  }
+  
+  const user = await storage.getUser(req.session.userId);
+  if (!user) {
+    return res.status(401).json({ message: 'Not authenticated' });
+  }
+  
+  if (user.role !== 'sub_admin' && user.role !== 'super_admin') {
+    return res.status(403).json({ message: 'Permission denied' });
+  }
+  
+  next();
+};
+
+// Super admin role validation middleware
+const isSuperAdmin = async (req: Request, res: Response, next: NextFunction) => {
+  if (!req.session.userId) {
+    return res.status(401).json({ message: 'Not authenticated' });
+  }
+  
+  const user = await storage.getUser(req.session.userId);
+  if (!user) {
+    return res.status(401).json({ message: 'Not authenticated' });
+  }
+  
+  if (user.role !== 'super_admin') {
+    return res.status(403).json({ message: 'Permission denied' });
+  }
+  
+  next();
+};
+
+declare module 'express-session' {
+  interface SessionData {
+    userId: number;
+    csrfToken?: string;
+  }
+}
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Apply Helmet security middleware with enhanced configuration
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"], // Necessary for React development
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        connectSrc: ["'self'", "https://api.coinbase.com", "https://api.stripe.com"],
+        frameSrc: ["'self'", "https://js.stripe.com"],
+        objectSrc: ["'none'"], // Prevents object tags
+        baseUri: ["'self'"], // Restricts base URIs that can be used
+        formAction: ["'self'"], // Restricts where forms can submit to
+        manifestSrc: ["'self'"], // Restricts manifest.json sources
+        fontSrc: ["'self'", "https://fonts.gstatic.com"], // Restricts font loading
+        mediaSrc: ["'self'"], // Restricts audio/video
+        workerSrc: ["'self'"], // Restricts worker scripts
+        frameAncestors: ["'self'"], // Prevents clickjacking
+        upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : null, // Forces HTTPS in production
+      }
+    },
+    // Other Helmet options
+    crossOriginEmbedderPolicy: false, // Required for some resources
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    referrerPolicy: { policy: "strict-origin-when-cross-origin" }, // Limits referrer info
+    xssFilter: true, // Enables XSS protection
+    noSniff: true, // Prevents MIME type sniffing
+    hsts: {
+      maxAge: 31536000, // 1 year in seconds
+      includeSubDomains: true,
+      preload: true
+    }
+  }));
+  
+  // CSRF Protection
+  // Generate token for GET requests
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (req.method === 'GET') {
+      // Add a CSRF token to the session if not present
+      if (!req.session.csrfToken) {
+        req.session.csrfToken = randomUUID();
+      }
+      // Add CSRF token to response headers for frontend to access
+      res.setHeader('X-CSRF-Token', req.session.csrfToken);
+    }
+    next();
+  });
+  
+  // Validate CSRF token for mutating requests
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    // Skip validation for GET, HEAD, OPTIONS
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+      return next();
+    }
+    
+    // Skip CSRF validation for webhook endpoints (they use their own validation)
+    if (req.path === '/api/webhooks/coinbase') {
+      return next();
+    }
+    
+    const tokenFromHeader = req.headers['x-csrf-token'];
+    const tokenFromSession = req.session.csrfToken;
+    
+    if (!tokenFromHeader || !tokenFromSession || tokenFromHeader !== tokenFromSession) {
+      console.warn('CSRF token validation failed', {
+        path: req.path,
+        method: req.method,
+        headerToken: tokenFromHeader ? 'present' : 'missing',
+        sessionToken: tokenFromSession ? 'present' : 'missing'
+      });
+      return res.status(403).json({ message: 'CSRF token validation failed' });
+    }
+    
+    next();
+  });
+  
+  // Enhanced rate limiting middleware to prevent brute force attacks
+  interface RateLimitRecord {
+    count: number;         // Number of attempts
+    firstAttempt: number;  // Timestamp of first attempt in window
+    blockedUntil: number | null; // Timestamp when block expires
+    email?: string;        // Track by email for account-specific limiting
+  }
+  
+  const RATE_LIMIT_CONFIG = {
+    MAX_IP_ATTEMPTS: 10,             // Max attempts per IP in window
+    MAX_ACCOUNT_ATTEMPTS: 5,         // Max attempts per account in window
+    IP_WINDOW_MS: 30 * 60 * 1000,    // 30 minute window for IP limiting
+    ACCOUNT_WINDOW_MS: 15 * 60 * 1000, // 15 minute window for account limiting
+    BLOCK_DURATION_MS: 60 * 60 * 1000, // 1 hour block
+    CLEANUP_PROBABILITY: 0.01,       // 1% chance to clean up per request
+  };
+  
+  // Separate tracking for IP and account-based rate limiting
+  const ipLoginAttempts = new Map<string, RateLimitRecord>();
+  const accountLoginAttempts = new Map<string, RateLimitRecord>();
+  
+  const loginRateLimit = (req: Request, res: Response, next: NextFunction) => {
+    // Only apply to login endpoint
+    if (req.path !== '/api/auth/login') return next();
+    
+    const now = Date.now();
+    
+    // 1. Check IP-based rate limiting
+    const ipAddress = (req.headers['x-forwarded-for'] as string) || req.ip || 'unknown';
+    const ipRecord = ipLoginAttempts.get(ipAddress) || { 
+      count: 0, 
+      firstAttempt: now,
+      blockedUntil: null
+    };
+    
+    // Check if IP is blocked
+    if (ipRecord.blockedUntil && ipRecord.blockedUntil > now) {
+      const retryAfterSeconds = Math.ceil((ipRecord.blockedUntil - now) / 1000);
+      res.setHeader('Retry-After', retryAfterSeconds.toString());
+      return res.status(429).json({ 
+        message: 'Too many login attempts from this IP. Please try again later.',
+        retryAfter: retryAfterSeconds
+      });
+    }
+    
+    // Reset count if window has expired
+    if (now - ipRecord.firstAttempt > RATE_LIMIT_CONFIG.IP_WINDOW_MS) {
+      ipRecord.count = 0;
+      ipRecord.firstAttempt = now;
+      ipRecord.blockedUntil = null;
+    }
+    
+    // 2. Check account-based rate limiting if email is provided
+    const { email } = req.body;
+    if (email && typeof email === 'string') {
+      const normalizedEmail = email.toLowerCase().trim();
+      const accountRecord = accountLoginAttempts.get(normalizedEmail) || {
+        count: 0,
+        firstAttempt: now,
+        blockedUntil: null,
+        email: normalizedEmail
+      };
+      
+      // Check if account is blocked
+      if (accountRecord.blockedUntil && accountRecord.blockedUntil > now) {
+        const retryAfterSeconds = Math.ceil((accountRecord.blockedUntil - now) / 1000);
+        res.setHeader('Retry-After', retryAfterSeconds.toString());
+        return res.status(429).json({ 
+          message: 'Too many login attempts for this account. Please try again later.',
+          retryAfter: retryAfterSeconds
+        });
+      }
+      
+      // Reset count if window has expired
+      if (now - accountRecord.firstAttempt > RATE_LIMIT_CONFIG.ACCOUNT_WINDOW_MS) {
+        accountRecord.count = 0;
+        accountRecord.firstAttempt = now;
+        accountRecord.blockedUntil = null;
+      }
+      
+      // Check if account exceeded attempts
+      if (accountRecord.count >= RATE_LIMIT_CONFIG.MAX_ACCOUNT_ATTEMPTS) {
+        accountRecord.blockedUntil = now + RATE_LIMIT_CONFIG.BLOCK_DURATION_MS;
+        accountLoginAttempts.set(normalizedEmail, accountRecord);
+        
+        const retryAfterSeconds = Math.ceil(RATE_LIMIT_CONFIG.BLOCK_DURATION_MS / 1000);
+        res.setHeader('Retry-After', retryAfterSeconds.toString());
+        return res.status(429).json({ 
+          message: 'Too many login attempts for this account. Please try again later.',
+          retryAfter: retryAfterSeconds
+        });
+      }
+      
+      // Increment account attempt counter
+      accountRecord.count++;
+      accountLoginAttempts.set(normalizedEmail, accountRecord);
+    }
+    
+    // Check if IP exceeded attempts
+    if (ipRecord.count >= RATE_LIMIT_CONFIG.MAX_IP_ATTEMPTS) {
+      ipRecord.blockedUntil = now + RATE_LIMIT_CONFIG.BLOCK_DURATION_MS;
+      ipLoginAttempts.set(ipAddress, ipRecord);
+      
+      const retryAfterSeconds = Math.ceil(RATE_LIMIT_CONFIG.BLOCK_DURATION_MS / 1000);
+      res.setHeader('Retry-After', retryAfterSeconds.toString());
+      return res.status(429).json({ 
+        message: 'Too many login attempts from this IP. Please try again later.',
+        retryAfter: retryAfterSeconds
+      });
+    }
+    
+    // Increment IP attempt counter
+    ipRecord.count++;
+    ipLoginAttempts.set(ipAddress, ipRecord);
+    
+    // Periodic cleanup of old records
+    if (Math.random() < RATE_LIMIT_CONFIG.CLEANUP_PROBABILITY) {
+      const cleanupTime = now - Math.max(
+        RATE_LIMIT_CONFIG.IP_WINDOW_MS,
+        RATE_LIMIT_CONFIG.ACCOUNT_WINDOW_MS,
+        RATE_LIMIT_CONFIG.BLOCK_DURATION_MS
+      );
+      
+      // Clean up IP records
+      for (const [key, record] of ipLoginAttempts.entries()) {
+        if (record.firstAttempt < cleanupTime && 
+            (!record.blockedUntil || record.blockedUntil < now)) {
+          ipLoginAttempts.delete(key);
+        }
+      }
+      
+      // Clean up account records
+      for (const [key, record] of accountLoginAttempts.entries()) {
+        if (record.firstAttempt < cleanupTime && 
+            (!record.blockedUntil || record.blockedUntil < now)) {
+          accountLoginAttempts.delete(key);
+        }
+      }
+    }
+    
+    next();
+  };
+  // Apply rate limiter to all routes
+  app.use(loginRateLimit);
+  
+  // Auth endpoints
+  app.post('/api/auth/register', async (req, res) => {
+    // Add security delay to prevent enumeration attacks
+    const securityDelay = () => new Promise(resolve => setTimeout(resolve, 100 + Math.random() * 200));
+    
+    try {
+      // Validate the request body
+      if (!req.body || typeof req.body !== 'object') {
+        await securityDelay();
+        return res.status(400).json({ message: 'Invalid request format' });
+      }
+      
+      try {
+        // Use Zod schema validation
+        const validatedData = insertUserSchema.parse(req.body);
+        
+        // Additional password strength validation
+        const password = validatedData.password;
+        if (password.length < 10) {
+          return res.status(400).json({ message: 'Password must be at least 10 characters long' });
+        }
+        
+        // Check for password complexity
+        const hasUppercase = /[A-Z]/.test(password);
+        const hasLowercase = /[a-z]/.test(password);
+        const hasNumbers = /[0-9]/.test(password);
+        const hasSpecialChars = /[^A-Za-z0-9]/.test(password);
+        
+        if (!(hasUppercase && hasLowercase && hasNumbers && hasSpecialChars)) {
+          return res.status(400).json({ 
+            message: 'Password must include uppercase, lowercase, numbers, and special characters' 
+          });
+        }
+        
+        // Normalize email to lowercase
+        const normalizedEmail = validatedData.email.toLowerCase().trim();
+        
+        // Check if user already exists (with security delay)
+        const existingUser = await storage.getUserByEmail(normalizedEmail);
+        if (existingUser) {
+          await securityDelay(); // Add delay to prevent email enumeration
+          return res.status(400).json({ message: 'User with this email already exists' });
+        }
+        
+        // Hash the password with bcrypt before storing
+        // Increased work factor from default 10 to 12 rounds for better security
+        const salt = await bcrypt.genSalt(12); 
+        const hashedPassword = await bcrypt.hash(validatedData.password, salt);
+        
+        // Create user with hashed password and normalized email
+        const user = await storage.createUser({
+          ...validatedData,
+          email: normalizedEmail,
+          password: hashedPassword,
+          // Add creation timestamp
+          createdAt: new Date()
+        });
+        
+        // Generate brand new session to prevent session fixation
+        req.session.regenerate((err) => {
+          if (err) {
+            console.error('Error regenerating session:', err);
+            return res.status(500).json({ message: 'Session error occurred' });
+          }
+          
+          // Set user ID in regenerated session
+          req.session.userId = user.id;
+          
+          // Set secure session parameters
+          req.session.cookie.httpOnly = true; // Prevent JavaScript access to cookie
+          req.session.cookie.secure = process.env.NODE_ENV === 'production'; // HTTPS only in production
+          req.session.cookie.sameSite = 'lax'; // Prevents CSRF while allowing normal navigation
+          
+          // Set maximum age for session (8 hours)
+          req.session.cookie.maxAge = 8 * 60 * 60 * 1000;
+          
+          // Save the session
+          req.session.save((err) => {
+            if (err) {
+              console.error('Error saving session:', err);
+              return res.status(500).json({ message: 'Session error occurred' });
+            }
+            
+            // Return the user without sensitive information
+            const { password, securityAnswer, ...userWithoutSensitiveInfo } = user;
+            
+            // Log successful registration
+            console.log(`User registered successfully: ${user.id} (${normalizedEmail})`);
+            
+            res.status(201).json(userWithoutSensitiveInfo);
+          });
+        });
+      } catch (zodError) {
+        if (zodError instanceof z.ZodError) {
+          return res.status(400).json({ message: zodError.errors[0].message });
+        }
+        throw zodError; // Re-throw if it's not a ZodError
+      }
+    } catch (error) {
+      console.error('Registration error:', error);
+      await securityDelay(); // Add delay even on errors
+      res.status(500).json({ message: 'An error occurred during registration' });
+    }
+  });
+  
+  app.post('/api/auth/login', async (req, res) => {
+    // Centralized security delay to mitigate timing attacks
+    // This helps prevent attackers from determining valid credentials based on response time
+    const securityDelay = () => new Promise(resolve => setTimeout(resolve, 100 + Math.random() * 200));
+    
+    try {
+      // Validate and sanitize input
+      if (!req.body || typeof req.body !== 'object') {
+        await securityDelay();
+        return res.status(400).json({ message: 'Invalid request format' });
+      }
+      
+      const { email, password, securityQuestion, securityAnswer } = req.body;
+      
+      // Validate required fields
+      if (!email || !password || !securityQuestion || !securityAnswer) {
+        await securityDelay();
+        return res.status(400).json({ message: 'All fields are required' });
+      }
+      
+      // Sanitize email
+      const sanitizedEmail = String(email).toLowerCase().trim();
+      
+      // Get user by email without password validation
+      const user = await storage.getUserByEmail(sanitizedEmail);
+      if (!user) {
+        // Use the same error message as invalid password for security
+        await securityDelay(); // Apply delay to prevent timing attacks
+        return res.status(401).json({ message: 'Invalid email or password' });
+      }
+      
+      // Compare hashed password using bcrypt (timing-safe comparison)
+      const passwordMatch = await bcrypt.compare(String(password), user.password);
+      if (!passwordMatch) {
+        await securityDelay(); // Apply delay to prevent timing attacks
+        return res.status(401).json({ message: 'Invalid email or password' });
+      }
+      
+      // Sanitize security inputs
+      const sanitizedQuestion = String(securityQuestion).trim();
+      const sanitizedAnswer = String(securityAnswer).trim();
+      
+      // Validate security question
+      const isSecurityValid = await storage.validateSecurityQuestion(
+        user.id, 
+        sanitizedQuestion, 
+        sanitizedAnswer
+      );
+      
+      if (!isSecurityValid) {
+        await securityDelay(); // Apply delay to prevent timing attacks
+        return res.status(401).json({ message: 'Invalid security question or answer' });
+      }
+      
+      // Set the user in the session with regenerated session ID to prevent session fixation
+      req.session.regenerate((err) => {
+        if (err) {
+          console.error('Error regenerating session:', err);
+          return res.status(500).json({ message: 'Session error occurred' });
+        }
+        
+        // Set user ID in regenerated session
+        req.session.userId = user.id;
+        
+        // Set secure session parameters
+        req.session.cookie.httpOnly = true; // Prevent JavaScript access
+        req.session.cookie.secure = process.env.NODE_ENV === 'production'; // HTTPS only in production
+        req.session.cookie.sameSite = 'lax'; // Prevents CSRF while allowing normal navigation
+        
+        // Set maximum age for session (8 hours)
+        req.session.cookie.maxAge = 8 * 60 * 60 * 1000;
+        
+        // Save updated session
+        req.session.save(async (err) => {
+          if (err) {
+            console.error('Error saving session:', err);
+            return res.status(500).json({ message: 'Session error occurred' });
+          }
+          
+          try {
+            // We could track last login timestamp here if needed
+            // Currently not implemented in the storage interface
+            
+            // Return the user without sensitive information
+            const { password: _, securityAnswer: __, ...userWithoutSensitiveInfo } = user;
+            
+            res.status(200).json(userWithoutSensitiveInfo);
+          } catch (error) {
+            console.error('Error in login completion:', error);
+            res.status(500).json({ message: 'An error occurred during login' });
+          }
+        });
+      });
+    } catch (error) {
+      console.error('Login error:', error);
+      await securityDelay(); // Apply delay even on errors
+      res.status(500).json({ message: 'An error occurred during login' });
+    }
+  });
+  
+  app.post('/api/auth/logout', (req, res) => {
+    req.session.destroy((err) => {
+      if (err) {
+        return res.status(500).json({ message: 'Failed to logout' });
+      }
+      res.status(200).json({ message: 'Logged out successfully' });
+    });
+  });
+  
+  app.get('/api/auth/me', async (req, res) => {
+    const userId = req.session.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Not authenticated' });
+    }
+    
+    try {
+      const user = await storage.getUser(userId);
+      if (!user) {
+        req.session.destroy(() => {});
+        return res.status(401).json({ message: 'User not found' });
+      }
+      
+      // Return the user without sensitive info
+      const { password, securityAnswer, ...userWithoutSensitiveInfo } = user;
+      
+      res.status(200).json(userWithoutSensitiveInfo);
+    } catch (error) {
+      res.status(500).json({ message: 'An error occurred while fetching user data' });
+    }
+  });
+  
+  // Listings endpoints
+  app.get('/api/listings/featured', async (req, res) => {
+    try {
+      const { country, state, city, type } = req.query;
+      
+      // Get featured listings with location filtering
+      const { listings } = await storage.getListings({
+        isFeatured: true,
+        perPage: 6, // Increased to provide more results when filtered
+        country: country as string | undefined,
+        state: state as string | undefined,
+        city: city as string | undefined,
+        type: type as string | undefined
+      });
+      
+      // Apply proper categorization to all listings
+      const correctedListings = listings.map(categorizeListing);
+      
+      // Additional filtering for type if needed
+      let filteredListings = correctedListings;
+      if (type) {
+        filteredListings = filteredListings.filter(
+          listing => listing.type === type
+        );
+      }
+      
+      // Log the filtering for debugging
+      console.log(`Featured listings filtered: country=${country}, state=${state}, city=${city}, type=${type}, found: ${filteredListings.length}`);
+      
+      res.status(200).json(filteredListings);
+    } catch (error) {
+      console.error('Error fetching featured listings:', error);
+      res.status(500).json({ message: 'Failed to fetch featured listings' });
+    }
+  });
+  
+  // Helper function to properly categorize listings
+  const categorizeListing = (listing: any) => {
+    // Personal connection patterns (strict patterns only)
+    const personalPatterns = [
+      /\bm4w\b/i, /\bw4m\b/i, /\bm4m\b/i, /\bw4w\b/i, 
+      /\bm4t\b/i, /\bw4t\b/i, /\bt4m\b/i, /\bt4w\b/i, /\bt4t\b/i,
+      /\bcouple4m\b/i, /\bcouple4w\b/i, /\bcouple4couple\b/i,
+      /\bman for woman\b/i, /\bwoman for man\b/i, /\bman for man\b/i, /\bwoman for woman\b/i
+    ];
+    
+    // Casual encounters keywords - these specifically identify casual content
+    const casualKeywords = [
+      "casual encounter", "hookup", "one night", "nsa", "fwb", "friend with benefit", 
+      "no strings", "discreet", "tonight only", "short term"
+    ];
+    
+    // Community & crypto related keywords
+    const communityKeywords = [
+      "crypto", "blockchain", "web3", "nft", "dao", "defi", 
+      "meetup", "study group", "developer", "token", "mining", "digital currency",
+      "smart contract", "decentralized", "cryptocurrency"
+    ];
+    
+    // Job related keywords
+    const jobKeywords = [
+      "job", "hiring", "position", "salary", "recruiter", "employment",
+      "career", "apply", "skills", "resume", "remote work", "full-time", "part-time",
+      "opportunity", "seeking candidates", "job opening"
+    ];
+    
+    // Business related keywords
+    const businessKeywords = [
+      "business", "service", "client", "customer", "product", "startup",
+      "company", "enterprise", "llc", "inc", "corporation", "franchise",
+      "partnership", "consulting", "agency", "professional service"
+    ];
+    
+    // Check if the listing should be a casual encounter
+    const isCasualListing = casualKeywords.some(keyword => 
+      listing.title.toLowerCase().includes(keyword) || 
+      (listing.description && listing.description.toLowerCase().includes(keyword))
+    );
+    
+    if (isCasualListing) {
+      if (listing.type !== "casual") {
+        console.log(`Correcting listing #${listing.id} from ${listing.type} to casual: ${listing.title}`);
+        listing.type = "casual";
+      }
+      return listing;
+    }
+    
+    // Check if the listing title matches any personal connection pattern
+    const isExactPersonalListing = personalPatterns.some(pattern => 
+      pattern.test(listing.title.toLowerCase())
+    );
+    
+    if (isExactPersonalListing) {
+      if (listing.type !== "personal" && listing.type !== "casual") {
+        console.log(`Correcting listing #${listing.id} from ${listing.type} to personal: ${listing.title}`);
+        listing.type = "personal";
+      }
+      return listing;
+    }
+    
+    // If listing is marked as personal or casual but doesn't match the patterns, recategorize
+    if (listing.type === "personal" || listing.type === "casual") {
+      // Check for community keywords
+      const hasCommunityKeywords = communityKeywords.some(keyword => 
+        listing.title.toLowerCase().includes(keyword) || 
+        (listing.description && listing.description.toLowerCase().includes(keyword))
+      );
+      
+      if (hasCommunityKeywords) {
+        console.log(`Correcting listing #${listing.id} from ${listing.type} to community: ${listing.title}`);
+        listing.type = "community";
+        return listing;
+      }
+      
+      // Check for job keywords
+      const hasJobKeywords = jobKeywords.some(keyword => 
+        listing.title.toLowerCase().includes(keyword) || 
+        (listing.description && listing.description.toLowerCase().includes(keyword))
+      );
+      
+      if (hasJobKeywords) {
+        console.log(`Correcting listing #${listing.id} from ${listing.type} to job: ${listing.title}`);
+        listing.type = "job";
+        return listing;
+      }
+      
+      // Check for business keywords
+      const hasBusinessKeywords = businessKeywords.some(keyword => 
+        listing.title.toLowerCase().includes(keyword) || 
+        (listing.description && listing.description.toLowerCase().includes(keyword))
+      );
+      
+      if (hasBusinessKeywords) {
+        console.log(`Correcting listing #${listing.id} from ${listing.type} to business: ${listing.title}`);
+        listing.type = "business";
+        return listing;
+      }
+    }
+    
+    return listing;
+  };
+
+  app.get('/api/listings/recent', async (req, res) => {
+    try {
+      const page = parseInt(req.query.page as string) || 1;
+      
+      const { country, state, city, type, subcategory } = req.query;
+      
+      const result = await storage.getListings({
+        page,
+        perPage: 4,
+        country: country as string | undefined,
+        state: state as string | undefined,
+        city: city as string | undefined,
+        type: type as string | undefined
+      });
+      
+      // Apply proper categorization to all listings
+      const correctedListings = result.listings.map(categorizeListing);
+      
+      // Apply strict category and subcategory filtering if needed
+      let filteredListings = correctedListings;
+      
+      // If type is specified, strictly filter by that type
+      if (type) {
+        filteredListings = filteredListings.filter(
+          listing => listing.type === type
+        );
+      }
+      
+      // If subcategory is specified, filter by that subcategory
+      if (subcategory) {
+        const subCategoryPattern = String(subcategory).toLowerCase();
+        
+        // For personals or casual encounters, we need more specific filtering for connection types
+        if (type === 'personal' || type === 'casual') {
+          // For personal connection types (M4W, W4M, etc.), look for exact patterns in title
+          const connectionPattern = new RegExp(`\\b${subCategoryPattern}\\b`, 'i');
+          filteredListings = filteredListings.filter(
+            listing => connectionPattern.test(listing.title.toLowerCase())
+          );
+          console.log(`Filtering ${type} by connection pattern "${subCategoryPattern}", found ${filteredListings.length} listings`);
+        } else {
+          // For other types, use the subcategory field if available, otherwise fall back to title
+          filteredListings = filteredListings.filter(listing => 
+            (listing.subcategory && listing.subcategory.toLowerCase() === subCategoryPattern) ||
+            listing.title.toLowerCase().includes(subCategoryPattern)
+          );
+        }
+      }
+      
+      res.status(200).json({
+        listings: filteredListings,
+        hasMore: filteredListings.length < result.listings.length ? false : result.hasMore
+      });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch recent listings' });
+    }
+  });
+  
+  // Get listings by state with strict category enforcement
+  app.get('/api/listings/byState', async (req, res) => {
+    try {
+      const { state, type, subcategory, city, country } = req.query;
+      
+      if (!state) {
+        return res.status(400).json({ error: "State parameter is required" });
+      }
+      
+      // Get listings with location filtering
+      const { listings, hasMore } = await storage.getListings({
+        country: country as string | undefined,
+        state: state as string,
+        city: city as string | undefined,
+        type: type as string | undefined,
+        perPage: 50 // Get more listings for state pages
+      });
+      
+      // Apply proper categorization to all listings
+      const correctedListings = listings.map(categorizeListing);
+      
+      // Apply strict category and subcategory filtering
+      let filteredListings = correctedListings;
+      
+      // If type is specified, strictly filter by that type
+      if (type) {
+        filteredListings = filteredListings.filter(
+          listing => listing.type === type
+        );
+      }
+      
+      // If subcategory is specified, filter by that subcategory
+      if (subcategory) {
+        const subCategoryPattern = String(subcategory).toLowerCase();
+        
+        // For personals, we need more specific filtering based on connection types
+        if (type === 'personal') {
+          // For personal connection types (M4W, W4M, etc.), look for exact matches in title
+          filteredListings = filteredListings.filter(
+            listing => listing.title.toLowerCase().includes(subCategoryPattern)
+          );
+          console.log(`Filtering personals by subcategory pattern "${subCategoryPattern}", found ${filteredListings.length} listings`);
+        } else {
+          // For other types, use the subcategory field if available, otherwise fall back to title
+          filteredListings = filteredListings.filter(listing => 
+            (listing.subcategory && listing.subcategory.toLowerCase() === subCategoryPattern) ||
+            listing.title.toLowerCase().includes(subCategoryPattern)
+          );
+        }
+      }
+      
+      console.log(`State listings: country=${country}, state=${state}, city=${city}, type=${type}, subcategory=${subcategory}, found=${filteredListings.length} listings`);
+      
+      res.status(200).json({ 
+        listings: filteredListings, 
+        hasMore: filteredListings.length < listings.length ? false : hasMore 
+      });
+    } catch (error) {
+      console.error("Error fetching state listings:", error);
+      res.status(500).json({ error: "Failed to fetch state listings" });
+    }
+  });
+  
+  // Search listings with advanced filtering including subcategory and strict category enforcement
+  app.get('/api/listings/search', async (req, res) => {
+    try {
+      const { state, type, subcategory, query, country, city } = req.query;
+      
+      // For URL path-based searches, default to California if state not provided
+      const searchState = state ? (state as string) : "California";
+      
+      // Get listings with all available filters
+      const { listings, hasMore } = await storage.getListings({
+        country: country as string | undefined,
+        state: searchState,
+        city: city as string | undefined,
+        type: type as string | undefined,
+        perPage: 100 // Get more listings for search pages
+      });
+      
+      // Apply proper categorization to all listings
+      const correctedListings = listings.map(categorizeListing);
+      
+      // Apply strict category and subcategory filtering
+      let filteredListings = correctedListings;
+      
+      // If type is specified, strictly filter by that type
+      if (type) {
+        filteredListings = filteredListings.filter(
+          listing => listing.type === type
+        );
+      }
+      
+      // If subcategory is specified, filter by that subcategory
+      if (subcategory) {
+        const subCategoryPattern = String(subcategory).toLowerCase();
+        
+        // For personals, we need more specific filtering based on connection types
+        if (type === 'personal') {
+          // For personal connection types (M4W, W4M, etc.), look for exact matches in title
+          filteredListings = filteredListings.filter(
+            listing => listing.title.toLowerCase().includes(subCategoryPattern)
+          );
+          console.log(`Filtering personals by subcategory pattern "${subCategoryPattern}", found ${filteredListings.length} listings`);
+        } else {
+          // For other types, use the subcategory field if available, otherwise fall back to title
+          filteredListings = filteredListings.filter(listing => 
+            (listing.subcategory && listing.subcategory.toLowerCase() === subCategoryPattern) ||
+            listing.title.toLowerCase().includes(subCategoryPattern)
+          );
+        }
+      }
+      
+      // Filter by search query if provided
+      if (query) {
+        const searchTerm = String(query).toLowerCase();
+        filteredListings = filteredListings.filter(listing => 
+          listing.title.toLowerCase().includes(searchTerm) || 
+          listing.description.toLowerCase().includes(searchTerm)
+        );
+      }
+      
+      console.log(`Search results: country=${country}, state=${state}, city=${city}, type=${type}, subcategory=${subcategory}, query=${query}, found=${filteredListings.length} listings`);
+      
+      res.status(200).json({ 
+        listings: filteredListings, 
+        hasMore: filteredListings.length < listings.length ? false : hasMore 
+      });
+    } catch (error) {
+      console.error("Error searching listings:", error);
+      res.status(500).json({ error: "Failed to search listings" });
+    }
+  });
+  
+  // Get a single listing by ID
+  app.get('/api/listings/:id([0-9]+)', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid listing ID' });
+      }
+      
+      const listing = await storage.getListing(id);
+      if (!listing) {
+        return res.status(404).json({ message: 'Listing not found' });
+      }
+      
+      res.status(200).json(listing);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch listing' });
+    }
+  });
+  
+  app.post('/api/listings', isAuthenticated, async (req, res) => {
+    const userId = req.session.userId;
+    
+    // Early validation to prevent type errors
+    if (userId === undefined) {
+      return res.status(401).json({ message: 'User authentication invalid' });
+    }
+    
+    try {
+      // Validate the request body
+      const validatedData = insertListingSchema.parse({
+        ...req.body,
+        userId
+      });
+      
+      // Set expiration date (30 days from now)
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + 30);
+      
+      // Create listing
+      const listing = await storage.createListing({
+        ...validatedData,
+        expiresAt
+      });
+      
+      // If it's a featured listing or job posting, create a payment
+      if (listing.isFeatured || listing.type === 'job') {
+        // Calculate amount based on listing type
+        const amount = listing.type === 'job' ? 1500 : 500; // $15 for job, $5 for featured
+        
+        // Validate listing has proper ID before proceeding
+        if (!listing.id || isNaN(listing.id)) {
+          await storage.deleteListing(listing.id); // Clean up the listing
+          return res.status(500).json({ 
+            message: 'Failed to create payment for listing - invalid listing ID' 
+          });
+        }
+        
+        try {
+          // Sanitize listing title for payment description
+          const safeTitle = listing.title
+            .replace(/[^\w\s.-]/g, '') // Remove any potentially dangerous characters
+            .substring(0, 50); // Limit length
+          
+          // Create Coinbase Commerce charge
+          const charge = await createCharge({
+            name: `Payment for listing #${listing.id}`,
+            description: listing.type === 'job' ? 
+              `Job posting fee: ${safeTitle}` : 
+              `Featured listing fee: ${safeTitle}`,
+            amount,
+            currency: 'USD',
+            listingId: listing.id,
+            userId: userId as number, // Explicit cast to satisfy type checker
+            metadata: {
+              listingType: listing.type,
+              isFeatured: listing.isFeatured ? true : false
+            }
+          });
+          
+          // Create payment record in database
+          await storage.createPayment({
+            userId,
+            listingId: listing.id,
+            amount,
+            currency: 'USD',
+            paymentMethod: 'crypto', // Use paymentMethod instead of provider
+            paymentType: listing.type === 'job' ? 'job' : 'featured',
+            status: 'pending',
+            coinbaseChargeId: charge.id
+            // createdAt is auto-generated by defaultNow()
+          });
+          
+          return res.status(201).json({
+            listing,
+            payment: {
+              chargeId: charge.id,
+              hostedUrl: charge.hosted_url,
+              amount,
+              expiresAt: charge.expires_at
+            }
+          });
+        } catch (error) {
+          console.error('Error creating charge for new listing:', error);
+          
+          // More robust error handling
+          if (error instanceof Error) {
+            return res.status(500).json({ 
+              message: 'Payment processing error', 
+              error: error.message
+            });
+          }
+          
+          return res.status(500).json({ 
+            message: 'Unknown payment processing error occurred' 
+          });
+        }
+      }
+      
+      res.status(201).json({ listing });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors[0].message });
+      }
+      res.status(500).json({ message: 'Failed to create listing' });
+    }
+  });
+  
+  app.put('/api/listings/:id', async (req, res) => {
+    const userId = req.session.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+    
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid listing ID' });
+      }
+      
+      // Get the listing to check ownership
+      const listing = await storage.getListing(id);
+      if (!listing) {
+        return res.status(404).json({ message: 'Listing not found' });
+      }
+      
+      // Check if the user owns the listing
+      if (listing.userId !== userId) {
+        return res.status(403).json({ message: 'You do not have permission to update this listing' });
+      }
+      
+      // Update the listing
+      const updatedListing = await storage.updateListing(id, req.body);
+      
+      res.status(200).json(updatedListing);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to update listing' });
+    }
+  });
+  
+  app.delete('/api/listings/:id', async (req, res) => {
+    const userId = req.session.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+    
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid listing ID' });
+      }
+      
+      // Get the listing to check ownership
+      const listing = await storage.getListing(id);
+      if (!listing) {
+        return res.status(404).json({ message: 'Listing not found' });
+      }
+      
+      // Check if the user owns the listing or is an admin
+      const user = await storage.getUser(userId);
+      if (listing.userId !== userId && user?.role !== 'super_admin' && user?.role !== 'sub_admin') {
+        return res.status(403).json({ message: 'You do not have permission to delete this listing' });
+      }
+      
+      // Delete the listing
+      await storage.deleteListing(id);
+      
+      res.status(200).json({ message: 'Listing deleted successfully' });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to delete listing' });
+    }
+  });
+  
+  // Payments endpoints
+  app.post('/api/payments/create-charge', async (req, res) => {
+    const userId = req.session.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+    
+    try {
+      const { listingId, amount, paymentType = 'featured' } = req.body;
+      
+      // Validate input
+      if (!listingId || !amount) {
+        return res.status(400).json({ message: 'Listing ID and amount are required' });
+      }
+      
+      // Get listing details for the charge
+      const listing = await storage.getListing(parseInt(listingId));
+      if (!listing) {
+        return res.status(404).json({ message: 'Listing not found' });
+      }
+      
+      // Check if the user owns the listing
+      if (listing.userId !== userId) {
+        return res.status(403).json({ message: 'You do not have permission to process payments for this listing' });
+      }
+      
+      // Determine payment name and description based on payment type
+      let name = '';
+      let description = '';
+      
+      switch(paymentType) {
+        case 'job':
+          name = `Job Posting: ${listing.title}`;
+          description = `Payment for job posting: ${listing.title}`;
+          break;
+        case 'boost':
+          name = `Boost: ${listing.title}`;
+          description = `Payment for boosting listing: ${listing.title}`;
+          break;
+        case 'featured':
+        default:
+          name = `Feature: ${listing.title}`;
+          description = `Payment for featuring listing: ${listing.title}`;
+          break;
+      }
+      
+      // Create Coinbase Commerce charge
+      const charge = await createCharge({
+        name,
+        description,
+        amount,
+        currency: 'USD',
+        listingId: parseInt(listingId),
+        userId,
+        metadata: {
+          listingType: listing.type,
+          paymentType,
+          isFeatured: paymentType === 'featured'
+        }
+      });
+      
+      // Create payment record in database
+      const payment = await storage.createPayment({
+        userId,
+        listingId: listing.id,
+        amount,
+        status: 'pending',
+        coinbaseChargeId: charge.id,
+        paymentType: paymentType as "featured" | "job" | "boost"
+      });
+      
+      res.status(201).json({
+        payment: {
+          id: payment.id,
+          chargeId: charge.id,
+          hostedUrl: charge.hosted_url,
+          amount,
+          expiresAt: charge.expires_at,
+          paymentType
+        }
+      });
+    } catch (error) {
+      console.error('Error creating charge:', error);
+      res.status(500).json({ message: 'Failed to create charge' });
+    }
+  });
+  
+  // Coinbase webhook endpoint
+  // We need raw body for signature verification
+  const rawBodyParser = express.raw({
+    type: 'application/json',
+    limit: '10mb',
+  });
+  
+  app.post('/api/webhooks/coinbase', rawBodyParser, async (req, res) => {
+    try {
+      // Get the signature from headers
+      const signature = req.headers['x-cc-webhook-signature'] as string;
+      
+      if (!signature) {
+        return res.status(400).json({ message: 'No signature provided' });
+      }
+      
+      // Verify the webhook signature
+      const webhookSecret = process.env.COINBASE_WEBHOOK_SECRET || '';
+      const rawBody = req.body.toString('utf8');
+      
+      if (!verifyWebhookSignature(rawBody, signature, webhookSecret)) {
+        return res.status(400).json({ message: 'Invalid signature' });
+      }
+      
+      // Process the webhook event
+      const event = JSON.parse(rawBody);
+      await processWebhookEvent(event);
+      
+      res.status(200).json({ received: true });
+    } catch (error) {
+      console.error('Error processing webhook:', error);
+      res.status(500).json({ message: 'Error processing webhook' });
+    }
+  });
+  
+  // Report endpoints
+  app.post('/api/reports', async (req, res) => {
+    const userId = req.session.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+    
+    try {
+      // Validate the request body
+      const validatedData = insertReportSchema.parse({
+        ...req.body,
+        userId
+      });
+      
+      // Create report
+      const report = await storage.createReport(validatedData);
+      
+      res.status(201).json({ report });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors[0].message });
+      }
+      res.status(500).json({ message: 'Failed to create report' });
+    }
+  });
+  
+  // Admin endpoints
+  app.get('/api/admin/reports', isAdmin, async (req, res) => {
+    try {
+      
+      const listingId = parseInt(req.query.listingId as string);
+      if (isNaN(listingId)) {
+        return res.status(400).json({ message: 'Invalid listing ID' });
+      }
+      
+      const reports = await storage.getReports(listingId);
+      
+      res.status(200).json({ reports });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch reports' });
+    }
+  });
+  
+  app.put('/api/admin/reports/:id', isAdmin, async (req, res) => {
+    try {
+      
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid report ID' });
+      }
+      
+      const { status } = req.body;
+      if (!status || !['pending', 'resolved', 'dismissed'].includes(status)) {
+        return res.status(400).json({ message: 'Invalid status' });
+      }
+      
+      const updatedReport = await storage.updateReportStatus(id, status);
+      if (!updatedReport) {
+        return res.status(404).json({ message: 'Report not found' });
+      }
+      
+      res.status(200).json({ report: updatedReport });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to update report' });
+    }
+  });
+
+  // Admin routes
+
+  // Admin - Get all reports
+  app.get('/api/admin/reports', isAdmin, async (req, res) => {
+    try {
+      // Fetch actual reports from storage
+      const listingId = req.query.listingId ? parseInt(req.query.listingId as string) : undefined;
+      
+      // If listingId is provided, validate it's a number
+      if (req.query.listingId && isNaN(Number(req.query.listingId))) {
+        return res.status(400).json({ message: 'Invalid listing ID parameter' });
+      }
+      
+      // Get reports from storage
+      const reports = listingId ? 
+        await storage.getReports(listingId) : 
+        []; // In a real app, would have a method to get all reports
+      
+      res.status(200).json(reports);
+    } catch (error) {
+      console.error('Error fetching reports:', error);
+      res.status(500).json({ message: 'Failed to fetch reports' });
+    }
+  });
+
+  // Admin - Get all users (super admin only)
+  app.get('/api/admin/users', isSuperAdmin, async (req, res) => {
+    try {
+      // In a real implementation, fetch actual users from database
+      // For security, filter out sensitive information before returning
+      
+      // Example of how we'd do this with real DB data:
+      // const allUsers = await db.select().from(users);
+      // const sanitizedUsers = allUsers.map(user => {
+      //   const { password, securityQuestion, securityAnswer, ...safeUserData } = user;
+      //   return safeUserData;
+      // });
+      
+      // Since we don't have an getAllUsers method in storage yet, return placeholder data
+      // that doesn't expose sensitive details
+      const placeholderUsers = [
+        {
+          id: 1,
+          username: "admin",
+          email: "admin@example.com", 
+          role: "super_admin",
+          createdAt: new Date().toISOString()
+        },
+        {
+          id: 2,
+          username: "user", 
+          email: "user@example.com",
+          role: "user",
+          createdAt: new Date().toISOString()
+        },
+        {
+          id: 3,
+          username: "moderator",
+          email: "moderator@example.com", 
+          role: "sub_admin",
+          createdAt: new Date().toISOString()
+        }
+      ];
+      
+      res.status(200).json(placeholderUsers);
+    } catch (error) {
+      console.error('Error fetching users:', error);
+      res.status(500).json({ message: 'Failed to fetch users' });
+    }
+  });
+
+  // Admin - Promote user to sub-admin (super admin only)
+  app.post('/api/admin/users/:id/promote', isSuperAdmin, async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      if (!id) {
+        return res.status(400).json({ message: 'User ID is required' });
+      }
+      
+      // This would normally update the user role in the database
+      // For demo, return success
+      res.status(200).json({ message: 'User promoted to sub-admin successfully' });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to promote user' });
+    }
+  });
+
+  // Admin - Demote sub-admin to user (super admin only)
+  app.post('/api/admin/users/:id/demote', isSuperAdmin, async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      if (!id) {
+        return res.status(400).json({ message: 'User ID is required' });
+      }
+      
+      // This would normally update the user role in the database
+      // For demo, return success
+      res.status(200).json({ message: 'User demoted successfully' });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to demote user' });
+    }
+  });
+
+  // Admin - Handle report action (approve/reject)
+  app.post('/api/admin/reports/:id/:action', isAdmin, async (req, res) => {
+    try {
+      const { id, action } = req.params;
+      
+      if (!id || !action) {
+        return res.status(400).json({ message: 'Report ID and action are required' });
+      }
+      
+      if (action !== 'approve' && action !== 'reject') {
+        return res.status(400).json({ message: 'Invalid action' });
+      }
+      
+      // This would normally update the report status in the database
+      // For demo, return success
+      res.status(200).json({ message: `Report ${action === 'approve' ? 'approved' : 'rejected'} successfully` });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to process report' });
+    }
+  });
+
+  // Admin - Delete listing (admin and sub-admin)
+  app.delete('/api/admin/listings/:id', isAdmin, async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      if (!id) {
+        return res.status(400).json({ message: 'Listing ID is required' });
+      }
+      
+      // This would normally delete the listing from the database
+      // For demo, return success
+      res.status(200).json({ message: 'Listing deleted successfully' });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to delete listing' });
+    }
+  });
+
+  // Admin - Get financial reports (super admin only)
+  app.get('/api/admin/reports/financial', isSuperAdmin, async (req, res) => {
+    try {
+      // This would normally aggregate financial data from the database
+      // For demo, return mock data
+      res.status(200).json({
+        totalListings: 1250,
+        totalPaidListings: 312,
+        totalRevenue: 15600,
+        countriesData: [
+          {
+            country: "United States",
+            totalListings: 850,
+            paidListings: 210,
+            revenue: 10500,
+            states: [
+              {
+                name: "California",
+                totalListings: 320,
+                paidListings: 95,
+                revenue: 4750
+              },
+              {
+                name: "New York",
+                totalListings: 280,
+                paidListings: 75,
+                revenue: 3750
+              },
+              {
+                name: "Texas",
+                totalListings: 250,
+                paidListings: 40,
+                revenue: 2000
+              }
+            ]
+          },
+          {
+            country: "Canada",
+            totalListings: 400,
+            paidListings: 102,
+            revenue: 5100,
+            states: [
+              {
+                name: "Ontario",
+                totalListings: 180,
+                paidListings: 55,
+                revenue: 2750
+              },
+              {
+                name: "British Columbia",
+                totalListings: 150,
+                paidListings: 32,
+                revenue: 1600
+              },
+              {
+                name: "Quebec",
+                totalListings: 70,
+                paidListings: 15,
+                revenue: 750
+              }
+            ]
+          }
+        ],
+        categoriesData: [
+          {
+            type: "job",
+            totalListings: 580,
+            paidListings: 210,
+            revenue: 10500
+          },
+          {
+            type: "business",
+            totalListings: 420,
+            paidListings: 98,
+            revenue: 4900
+          },
+          {
+            type: "personal",
+            totalListings: 250,
+            paidListings: 4,
+            revenue: 200
+          }
+        ]
+      });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch financial reports' });
+    }
+  });
+
+  const httpServer = createServer(app);
+  return httpServer;
+}

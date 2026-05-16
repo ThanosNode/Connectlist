@@ -1,0 +1,70 @@
+Perform a comprehensive audit and hardening of the entire ConnectList codebase. Focus on system reliability, bug elimination, and production readiness. Address the following areas using best practices for this stack:
+
+🔒 Error Handling & Stability
+Audit all frontend and backend code for unhandled errors or weak try/catch logic.
+
+Ensure all async functions (especially database and network operations) are safely wrapped with error boundaries.
+
+Add global and localized error boundaries in React, and middleware-level error handling in Express.
+
+Normalize frontend and backend error messages for clarity and debugging.
+
+🧩 API & Data Flow
+Ensure all API endpoints follow consistent REST principles and return structured success/error responses.
+
+Validate all API request payloads and query params using Zod on the frontend and backend.
+
+Fix any inconsistent response formats or status codes.
+
+Add loading, success, and error states in React using TanStack Query properly.
+
+🗃️ Database & Drizzle ORM
+Audit and fix all potential PostgreSQL socket/connection issues (timeouts, dropped connections).
+
+Add connection pooling if not present.
+
+Use Drizzle’s type-safe queries to ensure no raw or unsafe SQL operations exist.
+
+Implement retry logic for transient database failures.
+
+Sanitize all inputs at both application and database layers.
+
+🔄 WebSocket Handling (if active)
+Harden partial WebSocket implementation.
+
+Add reconnection logic, ping/pong handling, and server-side failover where applicable.
+
+🔗 Frontend Routing & Links
+Detect and fix all broken routes and dead links.
+
+Ensure Wouter route definitions match up with actual page structure.
+
+Add 404 fallbacks for unmatched routes.
+
+🧪 Forms & Validation
+Ensure all forms use proper schema validation via Zod and React Hook Form.
+
+Prevent client-side bypassing of form rules.
+
+Add server-side re-validation for critical user input (especially auth, passwords, job posts, etc).
+
+👮‍♂️ Authentication & Security
+Verify Express Session and Passport.js are configured securely (cookies, CSRF, session expiration).
+
+Ensure bcrypt is hashing passwords properly and securely (e.g. salt rounds ≥10).
+
+Block common attack vectors: SQLi, XSS, CSRF.
+
+Remove any hardcoded secrets or keys.
+
+📈 Performance & Production Readiness
+Optimize all React components for re-renders.
+
+Ensure Vite build output is properly tree-shaken and bundled.
+
+Add meaningful logging in Express (e.g. via morgan or a logger) and React (e.g. with devtools or Sentry).
+
+Add health checks and uptime monitoring if feasible.
+
+Fix all bugs, broken flows, unhandled edge cases, and system weak points. The goal is to make ConnectList resilient, secure, scalable, and user-ready.
+

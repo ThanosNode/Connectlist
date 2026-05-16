@@ -1,0 +1,161 @@
+ConnectList: Hardened Technical Architecture Overview
+
+System Overview
+ConnectList is a modern classified ads platform with optional Web3-based payment capabilities. It uses a robust, scalable client-server architecture that cleanly separates the frontend, backend, and data layers while ensuring stability, security, and maintainability.
+
+Tech Stack
+
+Frontend: React + TypeScript, Wouter (routing), TanStack Query (data fetching)
+
+Backend: Node.js + Express (REST API)
+
+Database: PostgreSQL via Drizzle ORM
+
+Styling: Tailwind CSS + shadcn/ui
+
+Authentication: Session-based, server-validated using Passport.js
+
+Payments: Supports Coinbase Commerce (crypto) and Stripe (fiat)
+
+Hosting: Replit for development, Vite for builds
+
+Core Features & Integrity Safeguards
+
+1. Authentication & Role Management
+
+Secure registration and login with bcrypt password hashing and security questions
+
+Session-based authentication with secure cookie handling
+
+Granular Role-Based Access Control (RBAC): user, sub_admin, super_admin
+
+Middleware-based access verification
+
+2. Listings System
+
+Listing Types: personal, job, business
+
+All listings are validated and filtered by category/subcategory server-side
+
+Supports location tagging and remote options (for job/business only)
+
+API and frontend use Zod for input validation
+
+Strict backend filtering prevents category crossover or misuse
+
+3. Location Services
+
+Hierarchical selection: Country > State > City
+
+Location preferences stored client-side with localStorage fallback
+
+Context API provides persistent location awareness
+
+4. Payments System
+
+Secure dual integration: Coinbase Commerce and Stripe
+
+Payment Types: featured listings, job postings, boosts
+
+Full payment lifecycle: selection, gateway confirmation, post-payment updates
+
+Robust error handling and confirmation validation in both frontend and backend
+
+5. Administrative Controls
+
+Admin Dashboard (role-gated): content moderation, user promotion, financial reports
+
+sub_admin: manage listings, moderate content
+
+super_admin: full access to reports, financials, and role management
+
+Financial metrics include type-based revenue, geography-based reporting, and paid/unpaid splits
+
+6. API & Data Management
+
+RESTful API with modular routing
+
+Input validation via Zod and backend sanitization
+
+Repository pattern for data access logic, promoting maintainability
+
+Graceful error handling middleware to capture and log exceptions
+
+7. Data Model
+
+Users: Auth + roles
+
+Listings: Core classified data
+
+Payments: Transactional records
+
+Reports: User-generated flags
+
+Sessions: Persistent login
+
+Relational mapping enforced through Drizzle ORM
+
+8. Security Enhancements
+
+bcrypt for all password storage
+
+Zod validation prevents malformed payloads
+
+Session cookies marked HTTP-only and secure
+
+Authorization middleware actively enforced
+
+ORM abstraction prevents raw SQL injection risk
+
+9. Performance & Resilience
+
+Indexing and pagination for scalable queries
+
+TanStack Query with caching for fast data loads
+
+Memoization and code splitting in UI
+
+Optimistic updates enhance UX
+
+10. Error Handling & Routing Stability
+
+Custom 404 fallback route
+
+Frontend + backend logging with descriptive errors
+
+Fallback UI states on fetch failure
+
+Dead link prevention via route validation
+
+11. Deployment Readiness
+
+Frontend: statically served via Vite
+
+Backend: Express server with environment-based config
+
+PostgreSQL: persistent data layer with remote connection pooling
+
+Configurable via environment variables
+
+12. Future Enhancements (Secure by Design)
+
+Web3 wallet support (non-custodial)
+
+NFT listings
+
+SEO optimizations
+
+Push notifications
+
+Mobile app with real-time chat (WebSockets + retries)
+
+Key Integrity Goals Achieved
+
+No raw SQL queries
+
+Full validation pipeline
+
+Monitored error states and fallback behavior
+
+Architectural resilience against 404s, database leaks, and API instability
+
